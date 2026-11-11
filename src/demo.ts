@@ -3,6 +3,7 @@
 // count: at most 5,000 characters of English letters, numbers, spaces, newlines and simple punctuation.
 import { page } from "./spec";
 
+export const REPO_URL = "https://github.com/NTBooks/faux-ipfs";
 export const DEMO_MAX = 5000;
 export const DEMO_PUNCT = ". , ! ? ' \" - : ; ( )";
 // letters, digits, space, newline, and . , ! ? ' " - : ; ( )   (no < > & / \ ` or anything else)
@@ -25,7 +26,8 @@ export function demoPage() {
   return page("Faux IPFS demo", `
     <h1>Faux IPFS</h1>
     <p>A private IPFS gateway on a Cloudflare Worker, R2 storage and KV: no IPFS node. Type some text, hash it, and it gets
-    pinned under the same CID a real IPFS node would give it (CIDv1, like <code>ipfs add --cid-version=1</code>).</p>
+    pinned under the same CID a real IPFS node would give it (CIDv1, like <code>ipfs add --cid-version=1</code>).
+    The code, how it works and what it costs: <a href="${REPO_URL}">${REPO_URL.replace("https://", "")}</a>.</p>
     <p class="note"><b>For this demo only simple input is allowed:</b> up to ${DEMO_MAX.toLocaleString("en")} characters of English
     letters (A-Z, a-z), numbers (0-9), spaces, new lines and simple punctuation (<code>${DEMO_PUNCT}</code>).
     Anything you pin here is public to anyone with its CID.</p>
@@ -36,7 +38,7 @@ export function demoPage() {
       <span class="bad" id="why"></span>
     </div>
     <div id="out" class="out"></div>
-    <p class="mut"><a href="/api">API spec</a> &middot; reads are <code>GET /ipfs/&lt;cid&gt;</code>, checked against the CID as they stream
+    <p class="mut"><a href="${REPO_URL}">Source on GitHub</a> &middot; <a href="/api">API spec</a> &middot; reads are <code>GET /ipfs/&lt;cid&gt;</code>, checked against the CID as they stream
     (add <code>?verify=false</code> to pass the bytes straight through).</p>
 <script>
   const t = document.getElementById('t'), go = document.getElementById('go'), why = document.getElementById('why'),
@@ -75,5 +77,5 @@ export function homePage() {
     <h1>Faux IPFS</h1>
     <p>A private IPFS gateway on a Cloudflare Worker, R2 storage and KV. Files get the same CIDs an IPFS node would give
     them, and reads are checked against the CID as they stream.</p>
-    <p>Read a file: <code>GET /ipfs/&lt;cid&gt;</code> &middot; <a href="/api">API spec</a></p>`);
+    <p>Read a file: <code>GET /ipfs/&lt;cid&gt;</code> &middot; <a href="/api">API spec</a> &middot; <a href="${REPO_URL}">Source on GitHub</a></p>`);
 }
