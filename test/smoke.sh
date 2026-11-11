@@ -42,7 +42,8 @@ want=$(sha < "$T/big.bin")
 ok "$(curl -s "$BASE/ipfs/$BIG" | sha)" "$want" "verified read returns the exact bytes"
 ok "$(curl -s "$BASE/ipfs/$BIG?verify=false" | sha)" "$want" "pass-through read returns the exact bytes"
 ok "$(curl -s -D - -o /dev/null "$BASE/ipfs/$BIG" | tr -d '\r' | sed -n 's/^x-faux-verify: //Ip')" verified "header says verified"
-ok "$(curl -s -D - -o /dev/null "$BASE/ipfs/$BIG?verify=false" | tr -d '\r' | sed -n 's/^x-faux-verify: //Ip')" skipped "header says skipped with ?verify=false"
+ok "$(curl -s -D - -o /dev/null "$BASE/ipfs/$BIG?verify=false&filename=p.bin" | tr -d '\r' | sed -n 's/^x-faux-verify: //Ip')" skipped "header says skipped with ?verify=false (uncached)"
+ok "$(curl -s -D - -o /dev/null "$BASE/ipfs/$BIG?verify=false" | tr -d '\r' | grep -ci -E '^x-faux-verify: verified|^x-faux-cache: HIT')" 2 "with the verified copy cached, ?verify=false gets that copy (labelled verified, HIT)"
 ok "$(curl -s -r 300000-300009 "$BASE/ipfs/$BIG" | sha)" "$(tail -c +300001 "$T/big.bin" | head -c 10 | sha)" "verified range across a chunk boundary"
 ok "$(curl -s -o /dev/null -w '%{http_code}' -r 0-99 "$BASE/ipfs/$BIG")" 206 "range answers 206"
 ok "$(curl -s -I "$BASE/ipfs/$HELLO" | tr -d '\r' | sed -n 's/^content-length: //Ip')" 11 "HEAD gives the length"
@@ -77,6 +78,21 @@ ok "$(curl -s -o /dev/null -w '%{http_code}' -H 'content-type: application/json'
 node -e "require('fs').writeFileSync('$T/max.json', JSON.stringify({text:'b'.repeat(5000)}))"
 ok "$(curl -s -o /dev/null -w '%{http_code}' -H 'content-type: application/json' --data-binary @"$T/max.json" "$BASE/demo/pin")" 201 "demo takes exactly 5000 characters"
 
+# ---- the edge cache: the first verified read stores the response, the next ones are hits
+hdr() { curl -s -D - -o /dev/null "$@" | tr -d '\r' | sed -n 's/^x-faux-cache: //Ip'; }
+C1=$(curl -s "${auth[@]}" -F file=@"$T/big.bin" -F name=cached.bin -F 'keyvalues={"t":"cache"}' -F cidVersion=0 "$BASE/api/files" | node -pe "JSON.parse(require('fs').readFileSync(0)).cid")
+ok "$(hdr "$BASE/ipfs/$C1")" MISS "cache: first read is a miss"
+ok "$(hdr "$BASE/ipfs/$C1")" HIT "cache: second read is a hit"
+ok "$(curl -s "$BASE/ipfs/$C1" | sha)" "$want" "cache: the hit has the exact bytes"
+ok "$(curl -s -D - -o /dev/null -r 300000-300009 "$BASE/ipfs/$C1" | tr -d '\r' | grep -ci -E '^HTTP/1.1 206|^x-faux-cache: HIT')" 2 "cache: a range is a 206 hit from the full copy"
+ok "$(curl -s -r 300000-300009 "$BASE/ipfs/$C1" | sha)" "$(tail -c +300001 "$T/big.bin" | head -c 10 | sha)" "cache: the cached range has the right bytes"
+ok "$(hdr "$BASE/ipfs/$C1?gatewayToken=x&verify=true")" HIT "cache: params that don't change the bytes share the entry"
+ok "$(hdr "$BASE/ipfs/$C1?download=true")" MISS "cache: download=true is its own entry"
+ok "$(hdr "$BASE/ipfs/$C1?filename=a.bin&verify=false")" MISS "cache: a pass-through miss..."
+ok "$(hdr "$BASE/ipfs/$C1?filename=a.bin")" MISS "cache: ...is never stored (unverified bytes stay out)"
+ok "$(curl -s -o /dev/null -w '%{http_code}' "${auth[@]}" -X DELETE "$BASE/api/files/$C1")" 200 "cache: delete"
+ok "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/ipfs/$C1")" 404 "cache: a deleted pin is 404 at once, though a copy is still cached"
+
 # ---- folders: upload files with paths in their names, like `ipfs add -r site`
 mkdir -p "$T/site/img"
 printf '<h1>hello from a folder</h1>' > "$T/site/index.html"
@@ -103,7 +119,7 @@ ok "$("$KUBO" block put --cid-codec=dag-pb "$T/dir.blk" 2>/dev/null)" "$DIR" "fo
 BIGF=$("$KUBO" add -Q --only-hash --cid-version=1 "$T/big.bin")
 node -e "const b=require('fs').readFileSync('$T/big.bin');b[900000]^=1;require('fs').writeFileSync('$T/bad2.bin',b)"
 curl -s -o /dev/null -X PUT --data-binary @"$T/bad2.bin" "$BASE/cdn-cgi/local/explorer/api/r2/buckets/faux-ipfs/objects/dirs%2F$DIR%2F$BIGF"
-got=$(curl -s "$BASE/ipfs/$DIR/img/big.bin" | wc -c | tr -d ' ')
+got=$(curl -s "$BASE/ipfs/$DIR/img/big.bin?filename=t1.bin" | wc -c | tr -d ' ')
 [ "$got" -lt 1300000 ] && ok stopped stopped "tampered folder file: verified read stops (sent $got of 1300000 bytes)" || ok "$got" "<1300000" "tampered folder file: verified read stops"
 ok "$(curl -s "$BASE/ipfs/$DIR/notes.txt")" 'same slime, same nuggets' "the folder's other files still verify"
 ok "$(curl -s -o /dev/null -w '%{http_code}' "${auth[@]}" -X DELETE "$BASE/api/files/$DIR")" 200 "delete the folder"
@@ -113,10 +129,12 @@ ok "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/ipfs/$DIR/notes.txt")" 404 "
 node -e "const b=require('fs').readFileSync('$T/big.bin');b[700000]^=1;require('fs').writeFileSync('$T/bad.bin',b)"
 # through wrangler dev's local explorer API (a second wrangler process would take the dev server down)
 curl -s -o /dev/null -X PUT --data-binary @"$T/bad.bin" "$BASE/cdn-cgi/local/explorer/api/r2/buckets/faux-ipfs/objects/files%2F$BIG"
-got=$(curl -s "$BASE/ipfs/$BIG" | wc -c | tr -d ' ')
+got=$(curl -s "$BASE/ipfs/$BIG?filename=t2.bin" | wc -c | tr -d ' ')
+ok "$(curl -s "$BASE/ipfs/$BIG" | sha)" "$want" "tampered file: the cached copy (verified before the tampering) still serves the good bytes"
+ok "$(curl -s "$BASE/ipfs/$BIG?filename=t2.bin" | wc -c | tr -d ' ' | awk '{print ($1<1300000)?"stopped":"served"}')" stopped "tampered file: a failed verification is never cached"
 [ "$got" -lt 1300000 ] && ok stopped stopped "tampered file: verified read stops early (sent $got of 1300000 bytes)" || ok "$got" "<1300000" "tampered file: verified read stops early"
-ok "$(curl -s "$BASE/ipfs/$BIG?verify=false" | sha)" "$(sha < "$T/bad.bin")" "tampered file: ?verify=false passes the bad bytes through"
-ok "$(curl -s -o /dev/null -w '%{http_code}' -r 0-99 "$BASE/ipfs/$BIG")" 206 "tampered file: a range in an untouched chunk still verifies"
+ok "$(curl -s "$BASE/ipfs/$BIG?verify=false&filename=t4.bin" | sha)" "$(sha < "$T/bad.bin")" "tampered file: ?verify=false passes the bad bytes through"
+ok "$(curl -s -o /dev/null -w '%{http_code}' -r 0-99 "$BASE/ipfs/$BIG?filename=t3.bin")" 206 "tampered file: a range in an untouched chunk still verifies"
 
 # ---- delete
 ok "$(curl -s -o /dev/null -w '%{http_code}' "${auth[@]}" -X DELETE "$BASE/api/files/$BIG")" 200 "delete"

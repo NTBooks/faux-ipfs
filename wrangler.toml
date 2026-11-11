@@ -16,6 +16,7 @@ id = "REPLACE_WITH_KV_NAMESPACE_ID"
 VERIFY_DEFAULT = "true"      # hash served bytes against the CID unless the request says ?verify=false
 DEFAULT_CID_VERSION = "1"    # 1 = bafy.../bafk... (what hosted pinning services hand out today), 0 = Qm...
 DEMO = "false"               # "true": the homepage is the public text-pinning demo (and POST /demo/pin opens)
+CACHE = "true"               # keep verified gateway responses in Cloudflare's edge cache (needs a custom domain)
 
 # Secrets (never in this file):
 #   npx wrangler secret put OWNER_TOKEN     required: the bearer token for upload / list / rename / delete

@@ -24,6 +24,7 @@ export interface Env {
   VERIFY_DEFAULT?: string;    // "true" (default) or "false": verify served bytes against the CID unless ?verify= says otherwise
   DEFAULT_CID_VERSION?: string; // "1" (default, what hosted pinning services hand out today) or "0"
   DEMO?: string;              // "true": the homepage is the public text-pinning demo, and POST /demo/pin exists
+  CACHE?: string;             // "true" (default) or "false": keep verified gateway responses in Cloudflare's edge cache
 }
 
 type Pin = {
@@ -260,15 +261,57 @@ function listing(cid: string, path: string, links: { name: string; cid: string; 
 <h2>/ipfs/<code>${escHtml(cid)}</code>/${escHtml(path)}</h2>${up}<table><tr><th align=left>Name</th><th align=left>CID</th><th align=left>Size (DAG)</th></tr>${rows}</table>`;
 }
 
-async function gateway(req: Request, url: URL, env: Env, cidStr: string, rest: string) {
+// ---------------------------------------------------------------- edge cache
+// A CID's bytes never change, so a verified response can sit in Cloudflare's cache for good (Cache-Control: immutable).
+// The cache is checked AFTER the gateway token and the pin lookup: a deleted pin 404s at once even while a copy is still
+// cached, and a private gateway stays private. Only verified responses are stored, so a hit is already-checked bytes;
+// if verification fails mid-stream, the copy being stored errors too and nothing is cached. Ranges are answered (206)
+// from the full cached copy. The cache is per data center, needs a custom domain, and isn't available to Workers
+// behind Cloudflare Access: every cache call is wrapped so the gateway just runs uncached there.
+const KEEP_PARAMS = ["filename", "download", "format"]; // the only query params that change the response
+const cacheOn = (env: Env) => (env.CACHE ?? "true") !== "false";
+function cacheKey(url: URL, range: string | null) {
+  const k = new URL(url.origin + url.pathname);
+  for (const n of KEEP_PARAMS) { const v = url.searchParams.get(n); if (v !== null) k.searchParams.set(n, v); }
+  return new Request(k.toString(), { method: "GET", headers: range ? { range } : {} });
+}
+const withHeader = (r: Response, name: string, value: string, body: BodyInit | null = r.body) => {
+  const h = new Headers(r.headers); h.set(name, value);
+  return new Response(body, { status: r.status, statusText: r.statusText, headers: h });
+};
+
+async function gateway(req: Request, url: URL, env: Env, ctx: ExecutionContext, cidStr: string, rest: string) {
   if (!(await canRead(req, url, env))) return err(401, "gateway token required");
   const root = parseCid(cidStr);
   if (!root) return err(400, "not a valid CID");
-  const cid = root.toString();
   // like a restricted dedicated gateway: only content pinned here is served (there is no network to fetch from), and a
   // file inside a folder is reached through the folder's CID plus its path
-  const p = await env.PINS.get<Pin>(`pin:${cid}`, "json");
+  const p = await env.PINS.get<Pin>(`pin:${root}`, "json");
   if (!p) return err(404, "not pinned on this gateway");
+  if (!cacheOn(env)) return gatewayServe(req, url, env, root, rest, p);
+
+  const cache = (caches as unknown as { default: Cache }).default;
+  const range = req.headers.get("range");
+  try {
+    const hit = await cache.match(cacheKey(url, range));
+    if (hit) {
+      const inm = req.headers.get("if-none-match");
+      if (inm && inm === hit.headers.get("etag")) return new Response(null, { status: 304, headers: { etag: inm, "x-faux-cache": "HIT" } });
+      return withHeader(hit, "x-faux-cache", "HIT", req.method === "HEAD" ? null : hit.body);
+    }
+  } catch { /* no cache here (behind Access, a preview): serve uncached */ }
+
+  const res = await gatewayServe(req, url, env, root, rest, p);
+  const storable = req.method === "GET" && !range && res.status === 200 && res.body && res.headers.get("x-faux-verify") === "verified";
+  if (!storable) return withHeader(res, "x-faux-cache", "MISS");
+  const [mine, theirs] = res.body!.tee();
+  const toCache = new Response(theirs, { status: 200, headers: res.headers });
+  ctx.waitUntil(cache.put(cacheKey(url, null), toCache).catch(() => { /* failed verification, too big, or no cache: skip */ }));
+  return withHeader(res, "x-faux-cache", "MISS", mine);
+}
+
+async function gatewayServe(req: Request, url: URL, env: Env, root: CID, rest: string, p: Pin) {
+  const cid = root.toString();
 
   const verifyParam = url.searchParams.get("verify") ?? req.headers.get("x-faux-verify");
   const verify = (verifyParam ?? env.VERIFY_DEFAULT ?? "true") !== "false";
@@ -336,11 +379,11 @@ async function gateway(req: Request, url: URL, env: Env, cidStr: string, rest: s
 
 // ---------------------------------------------------------------- router
 export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
+  async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
     const m = path.match(/^\/ipfs\/([^/]+)(\/.*)?$/);
-    if (m && (req.method === "GET" || req.method === "HEAD")) return gateway(req, url, env, m[1], m[2] ?? "");
+    if (m && (req.method === "GET" || req.method === "HEAD")) return gateway(req, url, env, ctx, m[1], m[2] ?? "");
     const html = (s: string) => new Response(s, { headers: { "content-type": "text/html; charset=utf-8", "x-content-type-options": "nosniff" } });
     const demo = ["true", "1", "yes", "on"].includes(String(env.DEMO ?? "").trim().toLowerCase());
     if (path === "/" && req.method === "GET") return html(demo ? demoPage() : homePage());

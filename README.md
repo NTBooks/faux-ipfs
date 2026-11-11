@@ -67,6 +67,20 @@ streamed as is, ranges and all, with no hashing. The `X-Faux-Verify` response he
 The tests prove both: `test/smoke.sh` flips one bit in a stored file, and the verified read refuses it while
 `?verify=false` serves the bad bytes.
 
+**The edge cache.** A CID's bytes never change, so verified gateway responses go into Cloudflare's cache (the Workers
+Cache API) and stay there (`Cache-Control: immutable`). The next read in that data center is served from the cache:
+no R2 read, no hashing. Every gateway response says `X-Faux-Cache: HIT` or `MISS`.
+- **The order matters.** The gateway token and the pin lookup (one KV read) run *before* the cache. A private gateway
+  stays private, and a deleted pin is 404 at once even while a copy is still cached.
+- **Only verified responses are stored.** If verification fails mid-stream, the copy being stored fails with it and
+  nothing is cached. A pass-through (`?verify=false`) miss is never stored. So a hit is always bytes that were checked
+  against the CID, and a `?verify=false` request that hits gets that checked copy (labelled `verified`).
+- **Ranges** are answered as 206 from the full cached copy. The cache key is the path plus the only parameters that
+  change the response (`filename`, `download`, `format`); tokens and `verify` don't split it.
+- **Limits:** the cache is per data center (each one fills on its first read there). It works on a custom domain. It
+  isn't available to Workers behind Cloudflare Access (see below), and it does nothing in the dashboard editor. When
+  it isn't available, the gateway runs uncached. `CACHE = "false"` turns it off.
+
 ## API
 
 The full spec is served at **`/api`** (and as OpenAPI at `/api/openapi.json`). It's linked from the homepage.
@@ -130,6 +144,9 @@ hostname.
   policy for the people allowed to read. They sign in once and get a cookie; nothing in the Worker changes.
 - Leave `/`, `/api` (the spec page) and `/demo/*` outside the application, or bypass them, if the demo should stay public.
 - Access works on a custom domain, and on `*.workers.dev` with the Worker's Access setting turned on.
+- **Access turns off the edge cache.** Cloudflare's docs: "For Workers fronted by Cloudflare Access, the Cache API is not
+  currently available." Putting only the owner paths behind Access keeps public reads cached. Putting `/ipfs/*` behind
+  it makes every read go to R2 and be verified again; that works, it just costs more R2 reads and CPU.
 
 **WAF custom rules** (Security → WAF on the zone):
 - Block the owner paths from everywhere except your IPs or countries:
@@ -159,7 +176,8 @@ The hosted plans compared ("Service A" and "Service B") are typical of IPFS pinn
   $0.08/GB and $0.15 per 10k.
 - **Service B:** $7.50/month for 500 GB stored and 250 GB of bandwidth, then $0.015/GB for each.
 
-Monthly cost for four workloads (reads assume ~3 R2 reads and 1 KV read each, verification on):
+Monthly cost for four workloads (reads assume ~3 R2 reads and 1 KV read each, verification on, and **no cache hits**,
+so these are the most it would cost):
 
 | Workload | Faux IPFS | Service A entry | Service A mid | Service B |
 |---|---|---|---|---|
@@ -174,7 +192,9 @@ How the Faux IPFS numbers add up:
 - **Heavy:** adds 50 M R2 reads ($18), 10 M KV reads ($5) and 10 M Worker requests ($3).
 
 Hashing for verification is SHA-256, at about 2 s of CPU per GB served, so even 10 TB fits in the plan's 30 M CPU-ms.
-Turning verification off (`?verify=false`) drops that CPU time to near zero.
+Turning verification off (`?verify=false`) drops that CPU time to near zero. With the edge cache, a hit costs one
+Worker request and one KV read: no R2 reads and no hashing. Popular files get much cheaper than the table shows; the
+storage line doesn't change.
 
 **Where the gap comes from:** almost entirely bandwidth. Hosted gateways charge $0.08-0.10/GB served past the plan;
 R2 charges nothing for egress. For small, mostly idle collections a free tier beats the $5 minimum.
@@ -182,7 +202,8 @@ R2 charges nothing for egress. For small, mostly idle collections a free tier be
 ## What it took
 
 About 1,000 lines including tests, written with Claude Code. The first version (single files, the API, the demo, this
-README) took 26 minutes from an empty folder to the first commit; folders took about 10 more.
+README) took 26 minutes from an empty folder to the first commit; folders took about 10 more, and the edge cache
+about 10 after that.
 - `src/dag.ts` (150 lines): kubo-identical CIDs for files and folders, path resolution, leaf rebuilding, tree verification.
 - `src/index.ts` (420): the gateway, folders, the owner API, the legacy aliases.
 - `src/spec.ts` (110): the API spec page and OpenAPI document.
@@ -206,7 +227,6 @@ indexing.
   Enterprise), and the upload is held in memory (128 MB) while it's hashed. Bigger files would need direct multipart
   uploads to R2 and hashing in a Queue consumer.
 - **Hash functions.** sha2-256 only (what `ipfs add` uses by default); no blake3 or other multihashes.
-- **No CDN cache in front of R2 yet.** Every read hits R2; adding the Cache API for verified responses is a small change.
 
 ## Setup
 
@@ -229,4 +249,5 @@ Local: put `OWNER_TOKEN=...` in `.dev.vars`, then `npx wrangler dev --port 8799 
   resolves every path with every node verified.
 - `bash test/smoke.sh`: against a running dev server on empty storage. Uploads files and a folder, kubo comparison,
   verified and pass-through reads, ranges, HEAD, folder redirects, `index.html` and listings, `format=raw` (checked by
-  kubo's `block put`), owner-only access, the legacy aliases, the demo's rules, tampering, delete. 54 checks.
+  kubo's `block put`), owner-only access, the legacy aliases, the demo's rules, the edge cache (hits, ranges, keys,
+  nothing unverified stored, deletes), tampering, delete. 68 checks.

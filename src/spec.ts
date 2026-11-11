@@ -10,7 +10,7 @@ export const OPS: Op[] = [
     params: [["cid", "path", "CIDv0 (Qm...) or CIDv1 (bafy..., bafk...)"], ["verify", "query", "false = pass the bytes through without hashing (default from VERIFY_DEFAULT)"],
       ["download", "query", "true = Content-Disposition: attachment"], ["filename", "query", "name for the download"], ["format", "query", "raw = the root block, for clients that verify it themselves"],
       ["gatewayToken", "query", "needed when GATEWAY_TOKEN is set (also pinataGatewayToken, or the x-gateway-token header)"], ["Range", "header", "bytes=a-b, answered 206"]],
-    returns: "200/206 the file, with Etag, X-Ipfs-Path, X-Ipfs-Roots, immutable Cache-Control and X-Faux-Verify: verified|skipped. 404 if not pinned here." },
+    returns: "200/206 the file, with Etag, X-Ipfs-Path, X-Ipfs-Roots, immutable Cache-Control, X-Faux-Verify: verified|skipped and X-Faux-Cache: HIT|MISS (verified responses are kept in the edge cache). 404 if not pinned here." },
   { method: "GET", path: "/ipfs/{cid}/{path}", auth: "gateway", summary: "A file or subfolder inside a pinned folder. Every folder node on the way is hashed against the CID that points to it.",
     params: [["path", "path", "e.g. img/photo.jpg; a folder path ends in /"], ["verify", "query", "false = no hashing"]],
     returns: "200/206 the file; a folder gives its index.html or a listing; 404 if the path isn't in the folder" },
