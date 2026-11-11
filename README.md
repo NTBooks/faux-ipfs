@@ -14,6 +14,16 @@ The question it answers: how much of a hosted IPFS pinning service is really "IP
 with hash indexing? Running a node becomes optional: you keep the content addressing and the verifiability, and
 drop the node.
 
+## The premise
+
+> **You only need to pin stuff to IPFS if you are no longer going to guarantee your own private gateway, so why pay
+> all that money now?**
+
+While you run your own private gateway, it's the only place anyone fetches your files from; nobody else on the IPFS
+network is serving them anyway. Pinning to the public network only matters for the day you stop. Because the CIDs
+here are identical to a real IPFS node's, that day you can pin the same bytes anywhere and every link, hash and
+on-chain reference keeps working.
+
 ## What an IPFS gateway is
 
 IPFS names a file by what it contains, not where it lives. `ipfs add` cuts the file into 256 KiB chunks, hashes each
