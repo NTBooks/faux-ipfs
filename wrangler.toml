@@ -2,6 +2,9 @@ name = "faux-ipfs"
 main = "src/index.ts"
 compatibility_date = "2026-10-01"
 
+# The live demo. A fork: change or remove this, and create your own bucket and KV namespace.
+routes = [{ pattern = "ipfs.slopscore.org", custom_domain = true }]
+
 # The files and their inner DAG nodes.  Create once: npx wrangler r2 bucket create faux-ipfs
 [[r2_buckets]]
 binding = "FILES"
@@ -10,12 +13,12 @@ bucket_name = "faux-ipfs"
 # The pin records.  Create once: npx wrangler kv namespace create PINS  (and paste the id it prints here)
 [[kv_namespaces]]
 binding = "PINS"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "460212575dd2462e838651c290a475cb"
 
 [vars]
 VERIFY_DEFAULT = "true"      # hash served bytes against the CID unless the request says ?verify=false
 DEFAULT_CID_VERSION = "1"    # 1 = bafy.../bafk... (what hosted pinning services hand out today), 0 = Qm...
-DEMO = "false"               # "true": the homepage is the public text-pinning demo (and POST /demo/pin opens)
+DEMO = "true"                # "true": the homepage is the public text-pinning demo (and POST /demo/pin opens)
 CACHE = "true"               # keep verified gateway responses in Cloudflare's edge cache (needs a custom domain)
 
 # Secrets (never in this file):

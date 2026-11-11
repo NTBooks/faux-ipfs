@@ -294,7 +294,9 @@ async function gateway(req: Request, url: URL, env: Env, ctx: ExecutionContext, 
   const range = req.headers.get("range");
   try {
     const hit = await cache.match(cacheKey(url, range));
-    if (hit) {
+    // a range answered with the whole cached file (seen in production: 200, not 206) would send every byte for a
+    // 100-byte request; skip that hit and serve the range from R2, which verifies only the chunks it touches
+    if (hit && !(range && hit.status !== 206)) {
       const inm = req.headers.get("if-none-match");
       if (inm && inm === hit.headers.get("etag")) return new Response(null, { status: 304, headers: { etag: inm, "x-faux-cache": "HIT" } });
       return withHeader(hit, "x-faux-cache", "HIT", req.method === "HEAD" ? null : hit.body);

@@ -2,6 +2,9 @@
 
 A private IPFS gateway emulated on Cloudflare: **one Worker, one R2 bucket, one KV namespace, no IPFS node.**
 
+**Live demo: [ipfs.slopscore.org](https://ipfs.slopscore.org)** (type some text, get its CID) · [API spec](https://ipfs.slopscore.org/api) ·
+[an example folder](https://ipfs.slopscore.org/ipfs/bafybeiaolvzzicjh6cayzr7rz2lggnvrqvyljokslynrkexbl72mtpwswm/)
+
 You upload a file or a folder, it gets the **same CID a real IPFS node would give it** (checked against kubo, the
 reference implementation, from 0 bytes to 100 MB, nested folders, CIDv0 and CIDv1), and `GET /ipfs/<cid>` (or
 `/ipfs/<cid>/path/in/folder`) serves it back the way an IPFS gateway does, **checking the bytes against the CID as
@@ -75,8 +78,10 @@ no R2 read, no hashing. Every gateway response says `X-Faux-Cache: HIT` or `MISS
 - **Only verified responses are stored.** If verification fails mid-stream, the copy being stored fails with it and
   nothing is cached. A pass-through (`?verify=false`) miss is never stored. So a hit is always bytes that were checked
   against the CID, and a `?verify=false` request that hits gets that checked copy (labelled `verified`).
-- **Ranges** are answered as 206 from the full cached copy. The cache key is the path plus the only parameters that
-  change the response (`filename`, `download`, `format`); tokens and `verify` don't split it.
+- **Ranges** are answered as 206 from the cached copy when the cache slices it. In production the cache sometimes
+  hands back the whole file for a Range request instead; that hit is skipped and the range is served from R2, which
+  verifies only the chunks it touches. The cache key is the path plus the only parameters that change the response
+  (`filename`, `download`, `format`); tokens and `verify` don't split it.
 - **Limits:** the cache is per data center (each one fills on its first read there). It works on a custom domain. It
   isn't available to Workers behind Cloudflare Access (see below), and it does nothing in the dashboard editor. When
   it isn't available, the gateway runs uncached. `CACHE = "false"` turns it off.
