@@ -20,9 +20,12 @@ drop the node.
 > all that money now?**
 
 While you run your own private gateway, it's the only place anyone fetches your files from; nobody else on the IPFS
-network is serving them anyway. Pinning to the public network only matters for the day you stop. Because the CIDs
-here are identical to a real IPFS node's, that day you can pin the same bytes anywhere and every link, hash and
-on-chain reference keeps working.
+network is serving them anyway. Durability is the storage's job, and verification doesn't need the network either:
+anyone can hash what the gateway serves and compare it to the CID. Pinning to the public network only matters for the
+day you stop. Because the CIDs here are identical to a real IPFS node's, that day you can pin the same bytes anywhere
+(with the default import settings: CIDv1, 256 KiB chunks, raw leaves) and every CID and on-chain reference keeps
+working. Links to this gateway's own hostname stop working unless you redirect them, and it assumes you stop on
+purpose: plan the move before the gateway goes away, not after.
 
 ## What an IPFS gateway is
 
