@@ -1,0 +1,322 @@
+// Faux IPFS: a private IPFS gateway on one Cloudflare Worker, an R2 bucket and a KV namespace. No IPFS node.
+//
+//   Owner API (Authorization: Bearer <OWNER_TOKEN>)        Gateway (open, or GATEWAY_TOKEN when set)
+//   POST   /api/files            upload, returns the CID    GET|HEAD /ipfs/<cid>   ?verify=false  ?download=true
+//   GET    /api/files            list                                             ?filename=x    ?format=raw
+//   GET    /api/files/<cid>      one record                                       Range requests
+//   PATCH  /api/files/<cid>      rename / keyvalues
+//   DELETE /api/files/<cid>      delete
+//   Legacy pinning-API aliases: /pinning/pinFileToIPFS, /pinning/pinJSONToIPFS, /pinning/unpin/<cid>, /data/pinList,
+//   /data/testAuthentication (so existing pinning-SDK calls can point here).
+//
+// Storage: R2 files/<cid> = the file, whole; R2 blocks/<cid>/<inner cid> = the file's inner DAG nodes (a few KB);
+// KV pin:<cid> = the record (name, size, type, created, keyvalues).
+import { build, leavesOf, leafBlock, matches, parseCid, type CidVersion, type Leaf } from "./dag";
+import type { CID } from "multiformats/cid";
+import { apiPage, openapi } from "./spec";
+import { demoPage, demoText, homePage } from "./demo";
+
+export interface Env {
+  FILES: R2Bucket;
+  PINS: KVNamespace;
+  OWNER_TOKEN: string;        // secret: wrangler secret put OWNER_TOKEN
+  GATEWAY_TOKEN?: string;     // optional secret: when set, gateway reads need it (or the owner token)
+  VERIFY_DEFAULT?: string;    // "true" (default) or "false": verify served bytes against the CID unless ?verify= says otherwise
+  DEFAULT_CID_VERSION?: string; // "1" (default, what hosted pinning services hand out today) or "0"
+  DEMO?: string;              // "true": the homepage is the public text-pinning demo, and POST /demo/pin exists
+}
+
+type Pin = {
+  cid: string; name: string; size: number; type: string; cidVersion: CidVersion;
+  created: string; keyvalues: Record<string, string>; inner: string[];
+};
+
+const json = (body: unknown, status = 200, headers: HeadersInit = {}) =>
+  new Response(JSON.stringify(body, null, 2), { status, headers: { "content-type": "application/json; charset=utf-8", ...headers } });
+const err = (status: number, message: string) => json({ error: message }, status);
+
+// ---------------------------------------------------------------- auth
+const enc = new TextEncoder();
+async function same(a: string, b: string) { // constant-time compare via HMAC of both sides
+  const k = await crypto.subtle.importKey("raw", crypto.getRandomValues(new Uint8Array(32)), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const [x, y] = await Promise.all([crypto.subtle.sign("HMAC", k, enc.encode(a)), crypto.subtle.sign("HMAC", k, enc.encode(b))]);
+  const u = new Uint8Array(x), v = new Uint8Array(y);
+  let d = 0; for (let i = 0; i < u.length; i++) d |= u[i] ^ v[i];
+  return d === 0;
+}
+const bearer = (req: Request) => req.headers.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1] ?? "";
+async function isOwner(req: Request, env: Env) {
+  if (!env.OWNER_TOKEN) return false; // never open by accident: no secret, no owner API
+  return same(bearer(req), env.OWNER_TOKEN);
+}
+async function canRead(req: Request, url: URL, env: Env) {
+  if (!env.GATEWAY_TOKEN) return true;
+  const t = url.searchParams.get("gatewayToken") ?? url.searchParams.get("pinataGatewayToken")
+    ?? req.headers.get("x-gateway-token") ?? req.headers.get("x-pinata-gateway-token");
+  if (t && (await same(t, env.GATEWAY_TOKEN))) return true;
+  return isOwner(req, env);
+}
+
+// ---------------------------------------------------------------- content types
+const TYPES: Record<string, string> = {
+  html: "text/html; charset=utf-8", htm: "text/html; charset=utf-8", txt: "text/plain; charset=utf-8", md: "text/markdown; charset=utf-8",
+  json: "application/json", js: "text/javascript", css: "text/css", svg: "image/svg+xml", png: "image/png", jpg: "image/jpeg",
+  jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", avif: "image/avif", pdf: "application/pdf", mp4: "video/mp4",
+  webm: "video/webm", mp3: "audio/mpeg", wav: "audio/wav", ogg: "audio/ogg", zip: "application/zip", csv: "text/csv",
+};
+const typeFor = (name: string, given?: string | null) =>
+  (given && given !== "application/octet-stream" ? given : TYPES[name.split(".").pop()?.toLowerCase() ?? ""]) ?? "application/octet-stream";
+
+// ---------------------------------------------------------------- upload
+async function* streamChunks(s: ReadableStream<Uint8Array>) {
+  const r = s.getReader();
+  for (;;) { const { done, value } = await r.read(); if (done) return; yield value; }
+}
+async function pin(env: Env, blob: Blob, name: string, type: string, v: CidVersion, keyvalues: Record<string, string>) {
+  const { root, inner, size } = await build(streamChunks(blob.stream()), v);
+  const cid = root.toString();
+  const existing = await env.PINS.get<Pin>(`pin:${cid}`, "json");
+  if (existing) return { pin: existing, isDuplicate: true };
+  await env.FILES.put(`files/${cid}`, blob, { httpMetadata: { contentType: type } });
+  await Promise.all([...inner].map(([c, bytes]) => env.FILES.put(`blocks/${cid}/${c}`, bytes)));
+  const p: Pin = { cid, name, size, type, cidVersion: v, created: new Date().toISOString(), keyvalues, inner: [...inner.keys()] };
+  await putPin(env, p);
+  return { pin: p, isDuplicate: false };
+}
+const putPin = (env: Env, p: Pin) =>
+  env.PINS.put(`pin:${p.cid}`, JSON.stringify(p), { metadata: { name: p.name.slice(0, 200), size: p.size, created: p.created } });
+
+const cidVersionOf = (env: Env, s?: string | null): CidVersion => ((s ?? env.DEFAULT_CID_VERSION ?? "1") === "0" ? 0 : 1);
+const parseJson = <T,>(s: string | File | null | undefined, fallback: T): T => {
+  if (typeof s !== "string" || !s) return fallback;
+  try { return JSON.parse(s) as T; } catch { return fallback; }
+};
+
+async function upload(req: Request, url: URL, env: Env) {
+  const ct = req.headers.get("content-type") ?? "";
+  if (ct.startsWith("multipart/form-data")) {
+    const form = await req.formData();
+    const file = form.get("file");
+    if (!(file instanceof File)) return { error: "multipart field 'file' is required" } as const;
+    // our fields (name, cidVersion, keyvalues) or the legacy pinning API's (pinataMetadata, pinataOptions)
+    const meta = parseJson<{ name?: string; keyvalues?: Record<string, string> }>(form.get("pinataMetadata"), {});
+    const opts = parseJson<{ cidVersion?: number }>(form.get("pinataOptions"), {});
+    const name = (form.get("name") as string) || meta.name || file.name || "file";
+    const kv = parseJson<Record<string, string>>(form.get("keyvalues"), meta.keyvalues ?? {});
+    const v = cidVersionOf(env, (form.get("cidVersion") as string) ?? (opts.cidVersion !== undefined ? String(opts.cidVersion) : null));
+    return pin(env, file, name, typeFor(name, file.type), v, kv);
+  }
+  // a raw body: POST /api/files?name=report.pdf&cidVersion=1
+  const blob = await req.blob();
+  const name = url.searchParams.get("name") || "file";
+  return pin(env, blob, name, typeFor(name, ct), cidVersionOf(env, url.searchParams.get("cidVersion")), parseJson(url.searchParams.get("keyvalues"), {}));
+}
+
+async function remove(env: Env, cid: string) {
+  const p = await env.PINS.get<Pin>(`pin:${cid}`, "json");
+  if (!p) return false;
+  await env.FILES.delete([`files/${cid}`, ...p.inner.map((c) => `blocks/${cid}/${c}`)]);
+  await env.PINS.delete(`pin:${cid}`);
+  return true;
+}
+
+async function list(env: Env, url: URL) {
+  const limit = Math.min(1000, Number(url.searchParams.get("limit") ?? 100) || 100);
+  const r = await env.PINS.list<{ name: string; size: number; created: string }>({ prefix: "pin:", limit, cursor: url.searchParams.get("cursor") ?? undefined });
+  return { files: r.keys.map((k) => ({ cid: k.name.slice(4), ...k.metadata })), cursor: r.list_complete ? null : r.cursor };
+}
+const pub = (p: Pin) => ({ cid: p.cid, name: p.name, size: p.size, type: p.type, cidVersion: p.cidVersion, created: p.created, keyvalues: p.keyvalues, url: `/ipfs/${p.cid}` });
+
+// ---------------------------------------------------------------- gateway
+const IMMUTABLE = "public, max-age=29030400, immutable";
+
+/** Bytes [start, end) of the file, read from R2 a leaf at a time and each leaf hashed against its CID before it is sent. */
+function verifiedBody(env: Env, cid: string, leaves: Leaf[], start: number, end: number): ReadableStream<Uint8Array> {
+  const need = leaves.filter((l) => l.offset + l.size > start && l.offset < end);
+  let i = 0;
+  return new ReadableStream<Uint8Array>({
+    async pull(ctl) {
+      if (i >= need.length) { ctl.close(); return; }
+      // read a run of up to 16 leaves (4 MiB) per R2 request, then check them one by one
+      const run = need.slice(i, i + 16);
+      const from = run[0].offset, to = run[run.length - 1].offset + run[run.length - 1].size;
+      const obj = await env.FILES.get(`files/${cid}`, { range: { offset: from, length: to - from } });
+      if (!obj) { ctl.error(new Error("file missing from storage")); return; }
+      const buf = new Uint8Array(await obj.arrayBuffer());
+      for (const l of run) {
+        const bytes = buf.subarray(l.offset - from, l.offset - from + l.size);
+        const leaf = parseCid(l.cid)!;
+        if (!(await matches(leaf, await leafBlock(leaf, bytes)))) {
+          // the stored bytes are not the bytes this CID names: stop rather than serve them
+          ctl.error(new Error(`leaf ${l.cid} at byte ${l.offset} failed verification`));
+          return;
+        }
+        const a = Math.max(start, l.offset) - l.offset, b = Math.min(end, l.offset + l.size) - l.offset;
+        if (b > a) ctl.enqueue(bytes.subarray(a, b));
+      }
+      i += run.length;
+    },
+  });
+}
+
+function parseRange(h: string | null, size: number): [number, number] | null | "bad" {
+  if (!h) return null;
+  const m = h.match(/^bytes=(\d*)-(\d*)$/);
+  if (!m || (m[1] === "" && m[2] === "")) return "bad";
+  let s: number, e: number;
+  if (m[1] === "") { s = Math.max(0, size - Number(m[2])); e = size; }
+  else { s = Number(m[1]); e = m[2] === "" ? size : Math.min(size, Number(m[2]) + 1); }
+  return s >= e || s >= size ? "bad" : [s, e];
+}
+
+const asciiName = (n: string) => n.replace(/[^\x20-\x7e]|["\\]/g, "_");
+const disposition = (kind: string, n: string) => `${kind}; filename="${asciiName(n)}"; filename*=UTF-8''${encodeURIComponent(n)}`;
+
+async function gateway(req: Request, url: URL, env: Env, cidStr: string, rest: string) {
+  if (!(await canRead(req, url, env))) return err(401, "gateway token required");
+  const root = parseCid(cidStr);
+  if (!root) return err(400, "not a valid CID");
+  if (rest && rest !== "/") return err(404, "paths inside a CID are not supported (single files only)");
+  const cid = root.toString();
+  // like a restricted dedicated gateway: only content pinned here is served (there is no network to fetch from)
+  const p = await env.PINS.get<Pin>(`pin:${cid}`, "json");
+  if (!p) return err(404, "not pinned on this gateway");
+
+  const verifyParam = url.searchParams.get("verify") ?? req.headers.get("x-faux-verify");
+  const verify = (verifyParam ?? env.VERIFY_DEFAULT ?? "true") !== "false";
+  const format = url.searchParams.get("format") ?? (req.headers.get("accept")?.includes("application/vnd.ipld.raw") ? "raw" : null);
+  const headers = new Headers({
+    etag: `"${cid}${format === "raw" ? ".raw" : ""}"`, "cache-control": IMMUTABLE, "x-ipfs-path": `/ipfs/${cid}`,
+    "x-ipfs-roots": cid, "ipfs-uri": `ipfs://${cid}`, "access-control-allow-origin": "*", "accept-ranges": "bytes",
+    "x-faux-verify": verify ? "verified" : "skipped",
+  });
+  if (req.headers.get("if-none-match") === headers.get("etag")) return new Response(null, { status: 304, headers });
+
+  // the root block itself, for clients that verify on their own (trustless gateway, raw format)
+  if (format === "raw") {
+    const stored = await env.FILES.get(`blocks/${cid}/${cid}`);
+    let block: Uint8Array | null = stored ? new Uint8Array(await stored.arrayBuffer()) : null;
+    if (!block) { // a single-leaf file: the root block is the leaf, rebuilt from the file's bytes
+      const obj = await env.FILES.get(`files/${cid}`);
+      if (!obj) return err(500, "file missing from storage");
+      block = await leafBlock(root, new Uint8Array(await obj.arrayBuffer()));
+    }
+    if (!(await matches(root, block))) return err(500, "stored block failed verification");
+    headers.set("content-type", "application/vnd.ipld.raw"); headers.set("x-content-type-options", "nosniff");
+    headers.set("content-disposition", disposition("attachment", `${cid}.bin`)); headers.delete("accept-ranges");
+    return new Response(req.method === "HEAD" ? null : (block as Uint8Array<ArrayBuffer>), { headers });
+  }
+  if (format && format !== "raw") return err(501, `format=${format} is not supported (raw only)`);
+
+  const name = url.searchParams.get("filename") ?? p.name;
+  headers.set("content-type", typeFor(name, p.type));
+  headers.set("content-disposition", disposition(url.searchParams.get("download") === "true" ? "attachment" : "inline", name));
+  const range = parseRange(req.headers.get("range"), p.size);
+  if (range === "bad") return new Response(null, { status: 416, headers: { "content-range": `bytes */${p.size}` } });
+  const [start, end] = range ?? [0, p.size];
+  headers.set("content-length", String(end - start));
+  const status = range ? 206 : 200;
+  if (range) { headers.set("content-range", `bytes ${start}-${end - 1}/${p.size}`); headers.set("etag", `"${cid}.${start}-${end - 1}"`); }
+  if (req.method === "HEAD") return new Response(null, { status, headers });
+
+  if (!verify) { // pass-through: straight from R2, no hashing
+    const obj = await env.FILES.get(`files/${cid}`, range ? { range: { offset: start, length: end - start } } : undefined);
+    if (!obj) return err(500, "file missing from storage");
+    return new Response(obj.body, { status, headers });
+  }
+  // verified: prove the tree under the requested CID first (every inner node hashed), then stream leaf by leaf
+  let leaves: Leaf[];
+  try {
+    leaves = await leavesOf(root, p.size, async (c) => {
+      const o = await env.FILES.get(`blocks/${cid}/${c}`);
+      return o ? new Uint8Array(await o.arrayBuffer()) : null;
+    }, true);
+  } catch (e) { return err(500, `verification failed: ${(e as Error).message}`); }
+  return new Response(verifiedBody(env, cid, leaves, start, end), { status, headers });
+}
+
+// ---------------------------------------------------------------- router
+export default {
+  async fetch(req: Request, env: Env): Promise<Response> {
+    const url = new URL(req.url);
+    const path = url.pathname;
+    const m = path.match(/^\/ipfs\/([^/]+)(\/.*)?$/);
+    if (m && (req.method === "GET" || req.method === "HEAD")) return gateway(req, url, env, m[1], m[2] ?? "");
+    const html = (s: string) => new Response(s, { headers: { "content-type": "text/html; charset=utf-8", "x-content-type-options": "nosniff" } });
+    const demo = ["true", "1", "yes", "on"].includes(String(env.DEMO ?? "").trim().toLowerCase());
+    if (path === "/" && req.method === "GET") return html(demo ? demoPage() : homePage());
+    if ((path === "/api" || path === "/api/") && req.method === "GET") return html(apiPage(url.origin));
+    if (path === "/api/openapi.json" && req.method === "GET") return json(openapi(url.origin), 200, { "access-control-allow-origin": "*" });
+    if (path === "/demo/pin" && req.method === "POST") {
+      if (!demo) return err(404, "not found");
+      const body = (await req.json().catch(() => null)) as { text?: unknown } | null;
+      const t = demoText(body?.text);
+      if ("error" in t) return err(400, t.error);
+      const blob = new Blob([t.text], { type: "text/plain; charset=utf-8" });
+      const r = await pin(env, blob, "demo.txt", "text/plain; charset=utf-8", 1, { demo: "true" });
+      return json({ cid: r.pin.cid, url: `/ipfs/${r.pin.cid}`, size: r.pin.size, isDuplicate: r.isDuplicate }, r.isDuplicate ? 200 : 201);
+    }
+    if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: { "access-control-allow-origin": "*", "access-control-allow-headers": "authorization, content-type, range, x-gateway-token, x-pinata-gateway-token", "access-control-allow-methods": "GET, HEAD, POST, PATCH, DELETE" } });
+
+    // everything below is the owner's
+    const api = path.startsWith("/api/") || path.startsWith("/pinning/") || path.startsWith("/data/");
+    if (!api) return err(404, "not found");
+    if (!(await isOwner(req, env))) return err(401, "owner token required (Authorization: Bearer ...)");
+
+    try {
+      // ---- the simple API
+      if (path === "/api/files" && req.method === "POST") {
+        const r = await upload(req, url, env);
+        if ("error" in r) return err(400, r.error as string);
+        return json({ ...pub(r.pin), isDuplicate: r.isDuplicate }, r.isDuplicate ? 200 : 201);
+      }
+      if (path === "/api/files" && req.method === "GET") return json(await list(env, url));
+      const f = path.match(/^\/api\/files\/([^/]+)$/);
+      if (f) {
+        const c = parseCid(f[1])?.toString();
+        if (!c) return err(400, "not a valid CID");
+        if (req.method === "DELETE") return (await remove(env, c)) ? json({ deleted: c }) : err(404, "not pinned");
+        const p = await env.PINS.get<Pin>(`pin:${c}`, "json");
+        if (!p) return err(404, "not pinned");
+        if (req.method === "GET") return json(pub(p));
+        if (req.method === "PATCH") {
+          const b = (await req.json().catch(() => ({}))) as { name?: string; keyvalues?: Record<string, string> };
+          if (typeof b.name === "string") p.name = b.name;
+          if (b.keyvalues && typeof b.keyvalues === "object") p.keyvalues = { ...p.keyvalues, ...b.keyvalues };
+          await putPin(env, p);
+          return json(pub(p));
+        }
+      }
+      if (path === "/api/whoami") return json({ owner: true });
+
+      // ---- legacy pinning-API aliases
+      if (path === "/pinning/pinFileToIPFS" && req.method === "POST") {
+        const r = await upload(req, url, env);
+        if ("error" in r) return err(400, r.error as string);
+        return json({ IpfsHash: r.pin.cid, PinSize: r.pin.size, Timestamp: r.pin.created, isDuplicate: r.isDuplicate });
+      }
+      if (path === "/pinning/pinJSONToIPFS" && req.method === "POST") {
+        const b = (await req.json()) as { pinataContent?: unknown; pinataMetadata?: { name?: string; keyvalues?: Record<string, string> }; pinataOptions?: { cidVersion?: number } };
+        const name = b.pinataMetadata?.name ?? "data.json";
+        const blob = new Blob([JSON.stringify(b.pinataContent ?? b)], { type: "application/json" });
+        const r = await pin(env, blob, name, "application/json", cidVersionOf(env, b.pinataOptions?.cidVersion?.toString()), b.pinataMetadata?.keyvalues ?? {});
+        return json({ IpfsHash: r.pin.cid, PinSize: r.pin.size, Timestamp: r.pin.created, isDuplicate: r.isDuplicate });
+      }
+      const u = path.match(/^\/pinning\/unpin\/([^/]+)$/);
+      if (u && req.method === "DELETE") {
+        const c = parseCid(u[1])?.toString();
+        return c && (await remove(env, c)) ? new Response("OK") : err(404, "not pinned");
+      }
+      if (path === "/data/pinList" && req.method === "GET") {
+        const l = await list(env, url);
+        return json({ count: l.files.length, rows: l.files.map((x) => ({ ipfs_pin_hash: x.cid, size: x.size, date_pinned: x.created, metadata: { name: x.name } })) });
+      }
+      if (path === "/data/testAuthentication") return json({ message: "Authenticated with Faux IPFS" });
+      return err(404, "not found");
+    } catch (e) {
+      return err(500, (e as Error).message);
+    }
+  },
+};
+
+export type { CID };

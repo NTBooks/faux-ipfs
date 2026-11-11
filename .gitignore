@@ -1,0 +1,8 @@
+node_modules/
+.wrangler/
+.dev.vars
+*.log
+.smoke-tmp/
+.smoke.log
+.wrangler-dev.log
+.explorer.json

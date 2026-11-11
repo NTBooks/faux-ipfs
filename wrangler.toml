@@ -1,0 +1,26 @@
+name = "faux-ipfs"
+main = "src/index.ts"
+compatibility_date = "2026-10-01"
+
+# The files and their inner DAG nodes.  Create once: npx wrangler r2 bucket create faux-ipfs
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "faux-ipfs"
+
+# The pin records.  Create once: npx wrangler kv namespace create PINS  (and paste the id it prints here)
+[[kv_namespaces]]
+binding = "PINS"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+[vars]
+VERIFY_DEFAULT = "true"      # hash served bytes against the CID unless the request says ?verify=false
+DEFAULT_CID_VERSION = "1"    # 1 = bafy.../bafk... (what hosted pinning services hand out today), 0 = Qm...
+DEMO = "false"               # "true": the homepage is the public text-pinning demo (and POST /demo/pin opens)
+
+# Secrets (never in this file):
+#   npx wrangler secret put OWNER_TOKEN     required: the bearer token for upload / list / rename / delete
+#   npx wrangler secret put GATEWAY_TOKEN   optional: when set, /ipfs/ reads need ?gatewayToken= or x-gateway-token
+# For `wrangler dev`, put them in .dev.vars instead (git-ignored).
+
+[limits]
+cpu_ms = 300000              # hashing a 100 MB upload takes CPU time; the paid plan allows up to 5 minutes
