@@ -2,10 +2,10 @@
 
 A private IPFS gateway emulated on Cloudflare: **one Worker, one R2 bucket, one KV namespace, no IPFS node.**
 
-You upload a file, it gets the **same CID a real IPFS node would give it** (checked against kubo, the reference
-implementation, from 0 bytes to 100 MB, CIDv0 and CIDv1), and `GET /ipfs/<cid>` serves it back the way an IPFS
-gateway does, **checking the bytes against the CID as they stream**. Add `?verify=false` to pass the bytes straight
-through instead.
+You upload a file or a folder, it gets the **same CID a real IPFS node would give it** (checked against kubo, the
+reference implementation, from 0 bytes to 100 MB, nested folders, CIDv0 and CIDv1), and `GET /ipfs/<cid>` (or
+`/ipfs/<cid>/path/in/folder`) serves it back the way an IPFS gateway does, **checking the bytes against the CID as
+they stream**. Add `?verify=false` to pass the bytes straight through instead.
 
 The question it answers: how much of a hosted IPFS pinning service is really "IPFS", and how much is a file server
 with hash indexing? Running a node becomes optional: you keep the content addressing and the verifiability, and
@@ -36,7 +36,8 @@ replaces the node with object storage.
 |---|---|---|
 | The gateway and the API | a Worker (`src/index.ts`) | routing, auth, hashing, verification |
 | The files | R2, `files/<cid>` | each file, whole (so pass-through reads and ranges come straight from R2) |
-| The tree | R2, `blocks/<cid>/<inner cid>` | the file's inner DAG nodes: a few KB even for a 100 MB file |
+| Folders' files | R2, `dirs/<folder cid>/<file cid>` | each file in a folder, whole, once per distinct content |
+| The tree | R2, `blocks/<cid>/<inner cid>` | inner DAG nodes and folder nodes: a few KB even for a 100 MB file |
 | The pins | KV, `pin:<cid>` | name, size, type, CID version, created, keyvalues |
 
 **Upload** (`src/dag.ts`): the bytes go through the reference JS importer (`ipfs-unixfs-importer`) with kubo's
@@ -50,6 +51,15 @@ CIDv0) against its leaf CID before sending it. A range request only checks the l
 If a leaf doesn't match, the stream stops there: bytes from that leaf onward are never sent. The response headers
 have already gone out by then, so the client sees a cut-off response; locally, `wrangler dev` turns a stream that
 fails before its first byte into a 500.
+
+**Folders** work the same way, one level up. A folder is a UnixFS directory node whose named links point at its files
+and subfolders; its CID is the hash of that node, so it covers every name and every byte inside. Upload a folder as
+several `file` parts whose filenames carry the path (`site/index.html`, `site/img/a.png`) and it gets the CID
+`ipfs add -r site` would give it (files with no shared top folder are wrapped, like `ipfs add -w`). Reading
+`/ipfs/<folder>/img/a.png` walks from the folder's node down the path, hashing each folder node against the CID that
+pointed to it, then serves the file exactly as above. A folder URL redirects to its slash form and serves the folder's
+`index.html` if it has one, or a listing. As on a restricted hosted gateway, a file inside a folder is reached through
+the folder's CID, not its own.
 
 **Pass-through read** (`?verify=false`, or `X-Faux-Verify: false`, or `VERIFY_DEFAULT = "false"`): the R2 object is
 streamed as is, ranges and all, with no hashing. The `X-Faux-Verify` response header says `verified` or `skipped`.
@@ -65,24 +75,31 @@ The full spec is served at **`/api`** (and as OpenAPI at `/api/openapi.json`). I
 
 | Method | Path | Does |
 |---|---|---|
-| `POST` | `/api/files` | upload (multipart `file`, optional `name`, `cidVersion`, `keyvalues`; or a raw body with `?name=`) |
+| `POST` | `/api/files` | upload (multipart `file`, optional `name`, `cidVersion`, `keyvalues`; or a raw body with `?name=`). Several `file` parts with paths in their filenames upload a folder |
 | `GET` | `/api/files` | list (`?limit=`, `?cursor=`) |
 | `GET` | `/api/files/<cid>` | one record |
 | `PATCH` | `/api/files/<cid>` | rename or add keyvalues (the CID never changes) |
-| `DELETE` | `/api/files/<cid>` | unpin and delete the file and its blocks |
+| `DELETE` | `/api/files/<cid>` | unpin and delete a file or folder, with everything stored for it |
 
 Legacy pinning-API aliases, so existing SDK calls can point here by changing the base URL:
 `POST /pinning/pinFileToIPFS`, `POST /pinning/pinJSONToIPFS`, `DELETE /pinning/unpin/<cid>`, `GET /data/pinList`,
 `GET /data/testAuthentication`. They take the same field names (`pinataMetadata`, `pinataOptions.cidVersion`) and
 answer `{IpfsHash, PinSize, Timestamp, isDuplicate}`.
 
-**Gateway**: `GET|HEAD /ipfs/<cid>` with `?verify=false`, `?download=true`, `?filename=`, `?format=raw`, `Range`.
-Open by default (it can only ever serve what's pinned here); set `GATEWAY_TOKEN` to require a token.
+**Gateway**: `GET|HEAD /ipfs/<cid>` and `/ipfs/<folder cid>/<path>` with `?verify=false`, `?download=true`,
+`?filename=`, `?format=raw`, `Range`. Open by default (it can only ever serve what's pinned here); set `GATEWAY_TOKEN`
+to require a token.
 
 ```bash
 curl -H "Authorization: Bearer $OWNER_TOKEN" -F file=@photo.jpg https://your-gateway/api/files
 curl https://your-gateway/ipfs/bafkrei...                  # verified
 curl "https://your-gateway/ipfs/bafkrei...?verify=false"    # pass-through
+
+# a folder: one file part per file, the path in the filename
+curl -H "Authorization: Bearer $OWNER_TOKEN" \
+  -F "file=@site/index.html;filename=site/index.html" -F "file=@site/img/a.png;filename=site/img/a.png" \
+  https://your-gateway/api/files
+curl https://your-gateway/ipfs/bafybei.../img/a.png
 ```
 
 ## The demo
@@ -164,12 +181,13 @@ R2 charges nothing for egress. For small, mostly idle collections a free tier be
 
 ## What it took
 
-About 750 lines including tests, in an afternoon with Claude Code:
-- `src/dag.ts` (90 lines): kubo-identical CIDs, leaf rebuilding, tree verification.
-- `src/index.ts` (320): the gateway, the owner API, the legacy aliases.
+About 1,000 lines including tests, written with Claude Code. The first version (single files, the API, the demo, this
+README) took 26 minutes from an empty folder to the first commit; folders took about 10 more.
+- `src/dag.ts` (150 lines): kubo-identical CIDs for files and folders, path resolution, leaf rebuilding, tree verification.
+- `src/index.ts` (420): the gateway, folders, the owner API, the legacy aliases.
 - `src/spec.ts` (110): the API spec page and OpenAPI document.
 - `src/demo.ts` (80): the demo page and its server-side rules.
-- `test/` (150): the kubo comparison and the end-to-end script.
+- `test/` (250): the kubo comparisons for files and folders, and the end-to-end script.
 
 The hard part of IPFS (chunking and the DAG) is a well-maintained library. The rest is a file server with hash
 indexing.
@@ -179,9 +197,11 @@ indexing.
 - **It isn't on the IPFS network.** No DHT announcements and no bitswap, so `ipfs.io` and other nodes can't fetch
   your content from it. That's the "node optional" trade. To publish to the public network as well, pin the same
   bytes to any IPFS node; the CID will match.
-- **Single files only.** No directories (`/ipfs/<cid>/path`), no `wrapWithDirectory`, no folder uploads, no IPNS.
-- **`format=raw` serves root blocks only.** Inner and leaf blocks by CID, and `format=car`, aren't there yet; both
-  are straightforward from what's stored.
+- **Very large folders.** A folder with thousands of entries in one directory gets sharded by IPFS (a HAMT); those are
+  refused for now. Folders upload in one request, so the size limit below covers the whole folder.
+- **No IPNS** (mutable names): every address here is a fixed CID.
+- **`format=raw` serves the block at the requested path only** (a file's root, a folder's node). Arbitrary inner and
+  leaf blocks by their own CID, and `format=car`, aren't there yet; both are straightforward from what's stored.
 - **Upload size.** Workers take request bodies up to 100 MB on the Free and Pro plans (200 MB Business, 500 MB
   Enterprise), and the upload is held in memory (128 MB) while it's hashed. Bigger files would need direct multipart
   uploads to R2 and hashing in a Queue consumer.
@@ -204,7 +224,9 @@ Local: put `OWNER_TOKEN=...` in `.dev.vars`, then `npx wrangler dev --port 8799 
 ## Tests
 
 - `npm test`: hashes 10 file sizes with this code and with kubo (`ipfs add --only-hash`, from the `kubo` npm package)
-  for CIDv0 and CIDv1, and checks every leaf can be rebuilt and verified. All 20 match.
-- `bash test/smoke.sh`: against a running dev server. Uploads, kubo comparison, verified and pass-through reads,
-  ranges, HEAD, `format=raw` (checked by kubo's `block put`), owner-only access, the legacy aliases, the demo's rules,
-  tampering, delete. 38 checks.
+  for CIDv0 and CIDv1, and checks every leaf can be rebuilt and verified (all 20 match). Then a nested folder with a
+  multi-chunk file, a duplicate and an empty file against `ipfs add -r`, plus loose files against `ipfs add -w`, and
+  resolves every path with every node verified.
+- `bash test/smoke.sh`: against a running dev server on empty storage. Uploads files and a folder, kubo comparison,
+  verified and pass-through reads, ranges, HEAD, folder redirects, `index.html` and listings, `format=raw` (checked by
+  kubo's `block put`), owner-only access, the legacy aliases, the demo's rules, tampering, delete. 54 checks.

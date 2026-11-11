@@ -11,7 +11,7 @@
 //
 // Storage: R2 files/<cid> = the file, whole; R2 blocks/<cid>/<inner cid> = the file's inner DAG nodes (a few KB);
 // KV pin:<cid> = the record (name, size, type, created, keyvalues).
-import { build, leavesOf, leafBlock, matches, parseCid, type CidVersion, type Leaf } from "./dag";
+import { build, buildDir, resolvePath, leavesOf, leafBlock, matches, parseCid, type CidVersion, type Leaf } from "./dag";
 import type { CID } from "multiformats/cid";
 import { apiPage, openapi } from "./spec";
 import { demoPage, demoText, homePage } from "./demo";
@@ -29,6 +29,9 @@ export interface Env {
 type Pin = {
   cid: string; name: string; size: number; type: string; cidVersion: CidVersion;
   created: string; keyvalues: Record<string, string>; inner: string[];
+  kind?: "file" | "dir";   // "dir": a folder; its files are R2 dirs/<cid>/<file cid>
+  files?: number;          // folders: how many files
+  objects?: string[];      // folders: the file CIDs stored under dirs/<cid>/
 };
 
 const json = (body: unknown, status = 200, headers: HeadersInit = {}) =>
@@ -84,7 +87,25 @@ async function pin(env: Env, blob: Blob, name: string, type: string, v: CidVersi
   return { pin: p, isDuplicate: false };
 }
 const putPin = (env: Env, p: Pin) =>
-  env.PINS.put(`pin:${p.cid}`, JSON.stringify(p), { metadata: { name: p.name.slice(0, 200), size: p.size, created: p.created } });
+  env.PINS.put(`pin:${p.cid}`, JSON.stringify(p), { metadata: { name: p.name.slice(0, 200), size: p.size, created: p.created, kind: p.kind ?? "file" } });
+
+/** A folder: every file with its path ("site/index.html"). Gets the CID `ipfs add -r` would give the folder. */
+async function pinDir(env: Env, files: File[], name: string | null, v: CidVersion, keyvalues: Record<string, string>) {
+  const items = await Promise.all(files.map(async (f) => ({ path: f.name, bytes: new Uint8Array(await f.arrayBuffer()) })));
+  const { root, inner, files: out, name: top } = await buildDir(items, v);
+  const cid = root.toString();
+  const existing = await env.PINS.get<Pin>(`pin:${cid}`, "json");
+  if (existing) return { pin: existing, isDuplicate: true };
+  const unique = new Map(out.map((f) => [f.cid, f]));
+  await Promise.all([...unique.values()].map((f) => env.FILES.put(`dirs/${cid}/${f.cid}`, f.bytes, { httpMetadata: { contentType: typeFor(f.path) } })));
+  await Promise.all([...inner].map(([c, bytes]) => env.FILES.put(`blocks/${cid}/${c}`, bytes)));
+  const p: Pin = {
+    cid, name: name || top || "folder", size: out.reduce((s, f) => s + f.size, 0), type: "inode/directory", cidVersion: v,
+    created: new Date().toISOString(), keyvalues, inner: [...inner.keys()], kind: "dir", files: out.length, objects: [...unique.keys()],
+  };
+  await putPin(env, p);
+  return { pin: p, isDuplicate: false };
+}
 
 const cidVersionOf = (env: Env, s?: string | null): CidVersion => ((s ?? env.DEFAULT_CID_VERSION ?? "1") === "0" ? 0 : 1);
 const parseJson = <T,>(s: string | File | null | undefined, fallback: T): T => {
@@ -96,14 +117,20 @@ async function upload(req: Request, url: URL, env: Env) {
   const ct = req.headers.get("content-type") ?? "";
   if (ct.startsWith("multipart/form-data")) {
     const form = await req.formData();
-    const file = form.get("file");
-    if (!(file instanceof File)) return { error: "multipart field 'file' is required" } as const;
+    const files = form.getAll("file").filter((f): f is File => f instanceof File);
+    if (!files.length) return { error: "multipart field 'file' is required" } as const;
     // our fields (name, cidVersion, keyvalues) or the legacy pinning API's (pinataMetadata, pinataOptions)
     const meta = parseJson<{ name?: string; keyvalues?: Record<string, string> }>(form.get("pinataMetadata"), {});
     const opts = parseJson<{ cidVersion?: number }>(form.get("pinataOptions"), {});
-    const name = (form.get("name") as string) || meta.name || file.name || "file";
     const kv = parseJson<Record<string, string>>(form.get("keyvalues"), meta.keyvalues ?? {});
     const v = cidVersionOf(env, (form.get("cidVersion") as string) ?? (opts.cidVersion !== undefined ? String(opts.cidVersion) : null));
+    // a folder: several files, or a filename with a path in it ("site/index.html"), the same convention the legacy API uses
+    if (files.length > 1 || files.some((f) => f.name.includes("/"))) {
+      try { return await pinDir(env, files, (form.get("name") as string) || meta.name || null, v, kv); }
+      catch (e) { return { error: (e as Error).message } as const; }
+    }
+    const file = files[0];
+    const name = (form.get("name") as string) || meta.name || file.name || "file";
     return pin(env, file, name, typeFor(name, file.type), v, kv);
   }
   // a raw body: POST /api/files?name=report.pdf&cidVersion=1
@@ -115,7 +142,9 @@ async function upload(req: Request, url: URL, env: Env) {
 async function remove(env: Env, cid: string) {
   const p = await env.PINS.get<Pin>(`pin:${cid}`, "json");
   if (!p) return false;
-  await env.FILES.delete([`files/${cid}`, ...p.inner.map((c) => `blocks/${cid}/${c}`)]);
+  const keys = [p.kind === "dir" ? null : `files/${cid}`, ...(p.objects ?? []).map((c) => `dirs/${cid}/${c}`), ...p.inner.map((c) => `blocks/${cid}/${c}`)]
+    .filter((k): k is string => !!k);
+  for (let i = 0; i < keys.length; i += 1000) await env.FILES.delete(keys.slice(i, i + 1000)); // R2 deletes up to 1000 keys a call
   await env.PINS.delete(`pin:${cid}`);
   return true;
 }
@@ -125,13 +154,16 @@ async function list(env: Env, url: URL) {
   const r = await env.PINS.list<{ name: string; size: number; created: string }>({ prefix: "pin:", limit, cursor: url.searchParams.get("cursor") ?? undefined });
   return { files: r.keys.map((k) => ({ cid: k.name.slice(4), ...k.metadata })), cursor: r.list_complete ? null : r.cursor };
 }
-const pub = (p: Pin) => ({ cid: p.cid, name: p.name, size: p.size, type: p.type, cidVersion: p.cidVersion, created: p.created, keyvalues: p.keyvalues, url: `/ipfs/${p.cid}` });
+const pub = (p: Pin) => ({
+  cid: p.cid, kind: p.kind ?? "file", name: p.name, size: p.size, type: p.type, cidVersion: p.cidVersion, created: p.created,
+  keyvalues: p.keyvalues, ...(p.kind === "dir" ? { files: p.files } : {}), url: `/ipfs/${p.cid}${p.kind === "dir" ? "/" : ""}`,
+});
 
 // ---------------------------------------------------------------- gateway
 const IMMUTABLE = "public, max-age=29030400, immutable";
 
 /** Bytes [start, end) of the file, read from R2 a leaf at a time and each leaf hashed against its CID before it is sent. */
-function verifiedBody(env: Env, cid: string, leaves: Leaf[], start: number, end: number): ReadableStream<Uint8Array> {
+function verifiedBody(env: Env, objKey: string, leaves: Leaf[], start: number, end: number): ReadableStream<Uint8Array> {
   const need = leaves.filter((l) => l.offset + l.size > start && l.offset < end);
   let i = 0;
   return new ReadableStream<Uint8Array>({
@@ -140,7 +172,7 @@ function verifiedBody(env: Env, cid: string, leaves: Leaf[], start: number, end:
       // read a run of up to 16 leaves (4 MiB) per R2 request, then check them one by one
       const run = need.slice(i, i + 16);
       const from = run[0].offset, to = run[run.length - 1].offset + run[run.length - 1].size;
-      const obj = await env.FILES.get(`files/${cid}`, { range: { offset: from, length: to - from } });
+      const obj = await env.FILES.get(objKey, { range: { offset: from, length: to - from } });
       if (!obj) { ctl.error(new Error("file missing from storage")); return; }
       const buf = new Uint8Array(await obj.arrayBuffer());
       for (const l of run) {
@@ -172,67 +204,134 @@ function parseRange(h: string | null, size: number): [number, number] | null | "
 const asciiName = (n: string) => n.replace(/[^\x20-\x7e]|["\\]/g, "_");
 const disposition = (kind: string, n: string) => `${kind}; filename="${asciiName(n)}"; filename*=UTF-8''${encodeURIComponent(n)}`;
 
+type Target = {
+  fileCid: CID; objKey: string; blockPrefix: string; size: number; name: string; type: string;
+};
+
+const readBlock = (env: Env, prefix: string) => async (c: string) => {
+  const o = await env.FILES.get(prefix + c);
+  return o ? new Uint8Array(await o.arrayBuffer()) : null;
+};
+
+/** One block by CID, from the stored inner blocks or rebuilt from a single-block file's bytes, checked against its CID. */
+async function rawBlock(env: Env, cid: CID, blockPrefix: string, objKey: string | null): Promise<Uint8Array | null> {
+  let block: Uint8Array | null = await readBlock(env, blockPrefix)(cid.toString());
+  if (!block && objKey) {
+    const obj = await env.FILES.get(objKey);
+    if (obj) block = await leafBlock(cid, new Uint8Array(await obj.arrayBuffer()));
+  }
+  return block && (await matches(cid, block)) ? block : null;
+}
+
+/** Serve one file (a single-file pin, or a file inside a folder), verified or passed through, with ranges and HEAD. */
+async function serveFile(req: Request, url: URL, env: Env, t: Target, verify: boolean, headers: Headers) {
+  const name = url.searchParams.get("filename") ?? t.name;
+  headers.set("content-type", typeFor(name, t.type));
+  headers.set("content-disposition", disposition(url.searchParams.get("download") === "true" ? "attachment" : "inline", name));
+  headers.set("accept-ranges", "bytes");
+  const range = parseRange(req.headers.get("range"), t.size);
+  if (range === "bad") return new Response(null, { status: 416, headers: { "content-range": `bytes */${t.size}` } });
+  const [start, end] = range ?? [0, t.size];
+  headers.set("content-length", String(end - start));
+  const status = range ? 206 : 200;
+  if (range) { headers.set("content-range", `bytes ${start}-${end - 1}/${t.size}`); headers.set("etag", `"${t.fileCid}.${start}-${end - 1}"`); }
+  if (req.method === "HEAD" || t.size === 0) return new Response(null, { status, headers });
+
+  if (!verify) { // pass-through: straight from R2, no hashing
+    const obj = await env.FILES.get(t.objKey, range ? { range: { offset: start, length: end - start } } : undefined);
+    if (!obj) return err(500, "file missing from storage");
+    return new Response(obj.body, { status, headers });
+  }
+  // verified: prove the tree under the file's CID first (every inner node hashed), then stream leaf by leaf
+  let leaves: Leaf[];
+  try { leaves = await leavesOf(t.fileCid, t.size, readBlock(env, t.blockPrefix), true); }
+  catch (e) { return err(500, `verification failed: ${(e as Error).message}`); }
+  return new Response(verifiedBody(env, t.objKey, leaves, start, end), { status, headers });
+}
+
+const ESC: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+const escHtml = (s: string) => s.replace(/[&<>"']/g, (c) => ESC[c]);
+
+function listing(cid: string, path: string, links: { name: string; cid: string; tsize: number }[]) {
+  const rows = links.map((l) => `<tr><td><a href="./${encodeURIComponent(l.name)}">${escHtml(l.name)}</a></td><td><code>${escHtml(l.cid)}</code></td><td>${l.tsize.toLocaleString("en")}</td></tr>`).join("");
+  const up = path ? `<p><a href="../">..</a></p>` : "";
+  return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>/ipfs/${escHtml(cid)}/${escHtml(path)}</title>
+<style>body{font:15px/1.5 system-ui,sans-serif;max-width:900px;margin:24px auto;padding:0 16px}td{padding:4px 14px 4px 0;border-top:1px solid #ddd;vertical-align:top}code{font-size:12px;word-break:break-all}</style>
+<h2>/ipfs/<code>${escHtml(cid)}</code>/${escHtml(path)}</h2>${up}<table><tr><th align=left>Name</th><th align=left>CID</th><th align=left>Size (DAG)</th></tr>${rows}</table>`;
+}
+
 async function gateway(req: Request, url: URL, env: Env, cidStr: string, rest: string) {
   if (!(await canRead(req, url, env))) return err(401, "gateway token required");
   const root = parseCid(cidStr);
   if (!root) return err(400, "not a valid CID");
-  if (rest && rest !== "/") return err(404, "paths inside a CID are not supported (single files only)");
   const cid = root.toString();
-  // like a restricted dedicated gateway: only content pinned here is served (there is no network to fetch from)
+  // like a restricted dedicated gateway: only content pinned here is served (there is no network to fetch from), and a
+  // file inside a folder is reached through the folder's CID plus its path
   const p = await env.PINS.get<Pin>(`pin:${cid}`, "json");
   if (!p) return err(404, "not pinned on this gateway");
 
   const verifyParam = url.searchParams.get("verify") ?? req.headers.get("x-faux-verify");
   const verify = (verifyParam ?? env.VERIFY_DEFAULT ?? "true") !== "false";
   const format = url.searchParams.get("format") ?? (req.headers.get("accept")?.includes("application/vnd.ipld.raw") ? "raw" : null);
+  if (format && format !== "raw") return err(501, `format=${format} is not supported (raw only)`);
+  const blockPrefix = `blocks/${cid}/`;
+  let segments: string[];
+  try { segments = rest.split("/").filter(Boolean).map(decodeURIComponent); } catch { return err(400, "bad path"); }
   const headers = new Headers({
-    etag: `"${cid}${format === "raw" ? ".raw" : ""}"`, "cache-control": IMMUTABLE, "x-ipfs-path": `/ipfs/${cid}`,
-    "x-ipfs-roots": cid, "ipfs-uri": `ipfs://${cid}`, "access-control-allow-origin": "*", "accept-ranges": "bytes",
+    "cache-control": IMMUTABLE, "x-ipfs-roots": cid, "access-control-allow-origin": "*",
     "x-faux-verify": verify ? "verified" : "skipped",
   });
-  if (req.headers.get("if-none-match") === headers.get("etag")) return new Response(null, { status: 304, headers });
-
-  // the root block itself, for clients that verify on their own (trustless gateway, raw format)
-  if (format === "raw") {
-    const stored = await env.FILES.get(`blocks/${cid}/${cid}`);
-    let block: Uint8Array | null = stored ? new Uint8Array(await stored.arrayBuffer()) : null;
-    if (!block) { // a single-leaf file: the root block is the leaf, rebuilt from the file's bytes
-      const obj = await env.FILES.get(`files/${cid}`);
-      if (!obj) return err(500, "file missing from storage");
-      block = await leafBlock(root, new Uint8Array(await obj.arrayBuffer()));
-    }
-    if (!(await matches(root, block))) return err(500, "stored block failed verification");
+  // set the per-path headers; true when the client already has this version (304)
+  const finish = (pathCid: string, ipfsPath: string) => {
+    headers.set("etag", `"${pathCid}${format === "raw" ? ".raw" : ""}"`);
+    headers.set("x-ipfs-path", ipfsPath); headers.set("ipfs-uri", `ipfs://${ipfsPath.slice(6)}`);
+    if (pathCid !== cid) headers.set("x-ipfs-roots", `${cid},${pathCid}`);
+    return req.headers.get("if-none-match") === headers.get("etag");
+  };
+  const raw = async (target: CID, objKey: string | null) => {
+    const block = await rawBlock(env, target, blockPrefix, objKey);
+    if (!block) return err(500, "stored block failed verification");
     headers.set("content-type", "application/vnd.ipld.raw"); headers.set("x-content-type-options", "nosniff");
-    headers.set("content-disposition", disposition("attachment", `${cid}.bin`)); headers.delete("accept-ranges");
+    headers.set("content-disposition", disposition("attachment", `${target}.bin`));
     return new Response(req.method === "HEAD" ? null : (block as Uint8Array<ArrayBuffer>), { headers });
-  }
-  if (format && format !== "raw") return err(501, `format=${format} is not supported (raw only)`);
+  };
+  const fileIn = async (fileCid: CID, knownSize: number | null, name: string, path: string) => {
+    const objKey = `dirs/${cid}/${fileCid}`;
+    if (finish(fileCid.toString(), path)) return new Response(null, { status: 304, headers });
+    if (format === "raw") return raw(fileCid, objKey);
+    let size = knownSize;
+    if (size === null) { const h = await env.FILES.head(objKey); if (!h) return err(500, "file missing from storage"); size = h.size; }
+    return serveFile(req, url, env, { fileCid, objKey, blockPrefix, size, name, type: typeFor(name) }, verify, headers);
+  };
 
-  const name = url.searchParams.get("filename") ?? p.name;
-  headers.set("content-type", typeFor(name, p.type));
-  headers.set("content-disposition", disposition(url.searchParams.get("download") === "true" ? "attachment" : "inline", name));
-  const range = parseRange(req.headers.get("range"), p.size);
-  if (range === "bad") return new Response(null, { status: 416, headers: { "content-range": `bytes */${p.size}` } });
-  const [start, end] = range ?? [0, p.size];
-  headers.set("content-length", String(end - start));
-  const status = range ? 206 : 200;
-  if (range) { headers.set("content-range", `bytes ${start}-${end - 1}/${p.size}`); headers.set("etag", `"${cid}.${start}-${end - 1}"`); }
-  if (req.method === "HEAD") return new Response(null, { status, headers });
-
-  if (!verify) { // pass-through: straight from R2, no hashing
-    const obj = await env.FILES.get(`files/${cid}`, range ? { range: { offset: start, length: end - start } } : undefined);
-    if (!obj) return err(500, "file missing from storage");
-    return new Response(obj.body, { status, headers });
+  if (p.kind !== "dir") { // ---- a single file
+    if (segments.length) return err(404, "this CID is a file, not a folder");
+    if (finish(cid, `/ipfs/${cid}`)) return new Response(null, { status: 304, headers });
+    if (format === "raw") return raw(root, `files/${cid}`);
+    return serveFile(req, url, env, { fileCid: root, objKey: `files/${cid}`, blockPrefix, size: p.size, name: p.name, type: p.type }, verify, headers);
   }
-  // verified: prove the tree under the requested CID first (every inner node hashed), then stream leaf by leaf
-  let leaves: Leaf[];
-  try {
-    leaves = await leavesOf(root, p.size, async (c) => {
-      const o = await env.FILES.get(`blocks/${cid}/${c}`);
-      return o ? new Uint8Array(await o.arrayBuffer()) : null;
-    }, true);
-  } catch (e) { return err(500, `verification failed: ${(e as Error).message}`); }
-  return new Response(verifiedBody(env, cid, leaves, start, end), { status, headers });
+
+  // ---- a folder: walk the path, hashing every folder node on the way (or not, with ?verify=false)
+  let r;
+  try { r = await resolvePath(root, segments, readBlock(env, blockPrefix), verify); }
+  catch (e) { return err(500, `verification failed: ${(e as Error).message}`); }
+  if (!r) return err(404, `no such path in this folder: /${segments.join("/")}`);
+  const sub = segments.join("/");
+  if (r.kind === "file") return fileIn(r.cid, r.size, segments[segments.length - 1] ?? p.name, `/ipfs/${cid}/${sub}`);
+
+  // a folder URL ends in a slash, like any gateway, so the relative links in its pages work
+  if (!rest.endsWith("/")) {
+    return new Response(null, { status: 301, headers: { location: `/ipfs/${cid}${sub ? "/" + segments.map(encodeURIComponent).join("/") : ""}/${url.search}` } });
+  }
+  const ipfsPath = `/ipfs/${cid}/${sub ? sub + "/" : ""}`;
+  if (format === "raw") { finish(r.cid.toString(), ipfsPath); return raw(r.cid, null); }
+  if (r.links.some((l) => l.name === "index.html")) { // serve the folder's index.html, as gateways do
+    const ir = await resolvePath(r.cid, ["index.html"], readBlock(env, blockPrefix), verify).catch(() => null);
+    if (ir && ir.kind === "file") return fileIn(ir.cid, ir.size, "index.html", `${ipfsPath}index.html`);
+  }
+  if (finish(r.cid.toString(), ipfsPath)) return new Response(null, { status: 304, headers });
+  headers.set("etag", `"DirIndex-${r.cid}"`); headers.set("content-type", "text/html; charset=utf-8");
+  return new Response(req.method === "HEAD" ? null : listing(cid, sub ? sub + "/" : "", r.links), { headers });
 }
 
 // ---------------------------------------------------------------- router

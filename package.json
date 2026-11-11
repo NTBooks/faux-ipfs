@@ -6,7 +6,8 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "test:cids": "tsx test/cids.test.ts",
-    "test": "tsx test/cids.test.ts"
+    "test": "tsx test/cids.test.ts && tsx test/dirs.test.ts",
+    "test:dirs": "tsx test/dirs.test.ts"
   },
   "author": "",
   "license": "ISC",

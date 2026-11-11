@@ -3,7 +3,7 @@
 #   bash test/smoke.sh [base-url]
 # Run the dev server with the demo on, on empty storage (rm -rf .wrangler/state first):
 #   npx wrangler dev --port 8799 --local --var DEMO:true
-# Uploads files, checks the CIDs against kubo (`ipfs add --only-hash`), reads them back verified and pass-through,
+# Uploads files and a folder, checks the CIDs against kubo (`ipfs add --only-hash`), reads them back verified and pass-through,
 # with ranges, HEAD and format=raw, checks owner-only access, then tampers with the stored bytes (local dev only)
 # to show verification refusing them while ?verify=false serves them.
 set -u
@@ -76,6 +76,38 @@ node -e "require('fs').writeFileSync('$T/long.json', JSON.stringify({text:'a'.re
 ok "$(curl -s -o /dev/null -w '%{http_code}' -H 'content-type: application/json' --data-binary @"$T/long.json" "$BASE/demo/pin")" 400 "demo refuses 5001 characters"
 node -e "require('fs').writeFileSync('$T/max.json', JSON.stringify({text:'b'.repeat(5000)}))"
 ok "$(curl -s -o /dev/null -w '%{http_code}' -H 'content-type: application/json' --data-binary @"$T/max.json" "$BASE/demo/pin")" 201 "demo takes exactly 5000 characters"
+
+# ---- folders: upload files with paths in their names, like `ipfs add -r site`
+mkdir -p "$T/site/img"
+printf '<h1>hello from a folder</h1>' > "$T/site/index.html"
+printf 'same slime, same nuggets' > "$T/site/notes.txt"
+cp "$T/big.bin" "$T/site/img/big.bin"
+printf '{"a":1}' > "$T/site/img/x.json"
+DIR=$(curl -s "${auth[@]}" -F "file=@$T/site/index.html;filename=site/index.html" -F "file=@$T/site/notes.txt;filename=site/notes.txt" \
+  -F "file=@$T/site/img/big.bin;filename=site/img/big.bin" -F "file=@$T/site/img/x.json;filename=site/img/x.json" "$BASE/api/files" \
+  | node -pe "const j=JSON.parse(require('fs').readFileSync(0)); j.kind==='dir' ? j.cid : 'not a folder: '+JSON.stringify(j)")
+ok "$DIR" "$("$KUBO" add -r -Q --cid-version=1 "$T/site")" "folder upload gives kubo's ipfs add -r CID"
+ok "$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "$BASE/ipfs/$DIR")" "301 $BASE/ipfs/$DIR/" "folder URL without a slash redirects to the slash"
+ok "$(curl -s "$BASE/ipfs/$DIR/")" '<h1>hello from a folder</h1>' "folder serves its index.html"
+ok "$(curl -s "$BASE/ipfs/$DIR/notes.txt")" 'same slime, same nuggets' "file by path"
+ok "$(curl -s "$BASE/ipfs/$DIR/img/big.bin" | sha)" "$want" "multi-chunk file in a subfolder, verified"
+ok "$(curl -s "$BASE/ipfs/$DIR/img/big.bin?verify=false" | sha)" "$want" "same file, pass-through"
+ok "$(curl -s -r 300000-300009 "$BASE/ipfs/$DIR/img/big.bin" | sha)" "$(tail -c +300001 "$T/big.bin" | head -c 10 | sha)" "range inside a folder file"
+ok "$(curl -s -I "$BASE/ipfs/$DIR/img/x.json" | tr -d '\r' | sed -n 's/^content-type: //Ip')" "application/json" "content type from the file name"
+ok "$(curl -s "$BASE/ipfs/$DIR/img/" | grep -c 'x.json')" 1 "a folder without index.html gets a listing"
+ok "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/ipfs/$DIR/nope.txt")" 404 "missing path is 404"
+ok "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/ipfs/$("$KUBO" add -Q --cid-version=1 "$T/site/notes.txt")")" 404 "a file's own CID isn't served alone (reach it through the folder)"
+curl -s "$BASE/ipfs/$DIR/?format=raw" -o "$T/dir.blk"
+ok "$("$KUBO" block put --cid-codec=dag-pb "$T/dir.blk" 2>/dev/null)" "$DIR" "format=raw folder block hashes to the folder CID (kubo)"
+# tamper with the copy of big.bin inside the folder: the verified read refuses it, pass-through serves it
+BIGF=$("$KUBO" add -Q --only-hash --cid-version=1 "$T/big.bin")
+node -e "const b=require('fs').readFileSync('$T/big.bin');b[900000]^=1;require('fs').writeFileSync('$T/bad2.bin',b)"
+curl -s -o /dev/null -X PUT --data-binary @"$T/bad2.bin" "$BASE/cdn-cgi/local/explorer/api/r2/buckets/faux-ipfs/objects/dirs%2F$DIR%2F$BIGF"
+got=$(curl -s "$BASE/ipfs/$DIR/img/big.bin" | wc -c | tr -d ' ')
+[ "$got" -lt 1300000 ] && ok stopped stopped "tampered folder file: verified read stops (sent $got of 1300000 bytes)" || ok "$got" "<1300000" "tampered folder file: verified read stops"
+ok "$(curl -s "$BASE/ipfs/$DIR/notes.txt")" 'same slime, same nuggets' "the folder's other files still verify"
+ok "$(curl -s -o /dev/null -w '%{http_code}' "${auth[@]}" -X DELETE "$BASE/api/files/$DIR")" 200 "delete the folder"
+ok "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/ipfs/$DIR/notes.txt")" 404 "deleted folder is gone"
 
 # ---- tamper with the stored bytes (local dev storage only): verification must refuse them
 node -e "const b=require('fs').readFileSync('$T/big.bin');b[700000]^=1;require('fs').writeFileSync('$T/bad.bin',b)"

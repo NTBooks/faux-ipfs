@@ -47,6 +47,68 @@ export async function build(content: AsyncIterable<Uint8Array> | Iterable<Uint8A
   return { root, inner, leaves, size };
 }
 
+export type DirFile = { path: string; cid: string; size: number; bytes: Uint8Array };
+
+const isDirNode = (bytes: Uint8Array) => {
+  const n = dagPb.decode(bytes);
+  if (!n.Data) return false;
+  const t = UnixFS.unmarshal(n.Data).type;
+  if (t === "hamt-sharded-directory") throw new Error("a folder this large is sharded (HAMT), which isn't supported yet");
+  return t === "directory";
+};
+
+/** Hash a folder the way `ipfs add -r` does. `files` carry their paths ("site/index.html", "site/img/a.png"); a single
+ * shared top folder becomes the root, as with `ipfs add -r site`, otherwise the files are wrapped in an unnamed folder
+ * (`ipfs add -r -w`). Returns the root CID, the blocks to keep (folder nodes and inner file nodes) and each file's CID. */
+export async function buildDir(files: { path: string; bytes: Uint8Array }[], v: CidVersion) {
+  const inner = new Map<string, Uint8Array>();
+  const blockstore = {
+    async put(cid: CID, bytes: Uint8Array) {
+      if (cid.code === dagPb.code && (dagPb.decode(bytes).Links.length > 0 || isDirNode(bytes))) inner.set(cid.toString(), bytes);
+      return cid;
+    },
+  };
+  const clean = files.map((f) => ({ ...f, path: f.path.replace(/\\/g, "/").replace(/^\/+/, "") }));
+  if (clean.some((f) => !f.path || f.path.split("/").some((s) => s === "" || s === "." || s === ".."))) throw new Error("bad file path");
+  const tops = new Set(clean.map((f) => f.path.split("/")[0]));
+  const shared = tops.size === 1 && clean.every((f) => f.path.includes("/")) ? [...tops][0] : null;
+  const out: DirFile[] = [];
+  let root: CID | undefined;
+  const opts = { ...importOptions(v), wrapWithDirectory: !shared };
+  for await (const e of importer(clean.map((f) => ({ path: f.path, content: [f.bytes] })), blockstore as never, opts)) {
+    const p = e.path ?? "";
+    if (shared ? p === shared : p === "") root = e.cid;
+    const f = clean.find((x) => x.path === p);
+    if (f) out.push({ path: shared ? p.slice(shared.length + 1) : p, cid: e.cid.toString(), size: f.bytes.byteLength, bytes: f.bytes });
+  }
+  if (!root) throw new Error("importer produced no root folder");
+  return { root, inner, files: out, name: shared ?? "" };
+}
+
+export type Resolved =
+  | { kind: "dir"; cid: CID; links: { name: string; cid: string; tsize: number }[] }
+  | { kind: "file"; cid: CID; size: number | null }; // size null: a single-block file, its size is its stored object's
+
+/** Follow `segments` from a folder `root`, hashing every node on the way against the CID that pointed to it. */
+export async function resolvePath(root: CID, segments: string[], getInner: (cid: string) => Promise<Uint8Array | null>, verify: boolean): Promise<Resolved | null> {
+  let cur = root;
+  for (let i = 0; ; i++) {
+    const bytes = cur.code === dagPb.code ? await getInner(cur.toString()) : null;
+    if (!bytes) return i === segments.length ? { kind: "file", cid: cur, size: null } : null;
+    if (verify && !(await matches(cur, bytes))) throw new Error(`block ${cur} does not match its CID`);
+    const node = dagPb.decode(bytes);
+    const fs = UnixFS.unmarshal(node.Data!);
+    if (fs.type !== "directory") {
+      if (i !== segments.length) return null; // can't walk into a file
+      return { kind: "file", cid: cur, size: Number(fs.fileSize()) };
+    }
+    if (i === segments.length) return { kind: "dir", cid: cur, links: node.Links.map((l) => ({ name: l.Name ?? "", cid: l.Hash.toString(), tsize: l.Tsize ?? 0 })) };
+    const link = node.Links.find((l) => l.Name === segments[i]);
+    if (!link) return null;
+    cur = link.Hash;
+  }
+}
+
 /** Rebuild a leaf block from its bytes, so the leaf can be checked without storing it separately. */
 export async function leafBlock(cid: CID, bytes: Uint8Array): Promise<Uint8Array> {
   if (cid.code === raw.code) return bytes;
